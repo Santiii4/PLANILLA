@@ -15,12 +15,12 @@ except ImportError:
     GSPREAD_AVAILABLE = False
 
 # ==============================================================================
-# CONFIGURACIÓN DE RUTAS
+# CONFIGURACIÓN DE RUTAS Y AUTENTICACIÓN
 # ==============================================================================
 DIRECTORIO_APP = os.path.dirname(os.path.abspath(__file__))
 
 def obtener_ruta_credenciales():
-    """Busca el archivo credentials.json exactamente donde está app.py."""
+    """Busca el archivo credentials.json localmente si existe."""
     posibles_nombres = [
         "credentials.json",
         "credentials.json.json",
@@ -33,6 +33,15 @@ def obtener_ruta_credenciales():
         if os.path.exists(nombre):
             return os.path.abspath(nombre)
     return None
+
+def verificar_credenciales_disponibles():
+    """Verifica si hay credenciales en Streamlit Secrets o en archivo local."""
+    try:
+        if "gcp_service_account" in st.secrets:
+            return True
+    except Exception:
+        pass
+    return obtener_ruta_credenciales() is not None
 
 # ==============================================================================
 # 1. CONFIGURACIÓN DE LA PÁGINA
@@ -69,7 +78,7 @@ def limpiar_campo(txt: str) -> str:
     return re.sub(r'\s+', ' ', txt).strip()
 
 def procesar_manifiesto(texto: str, nombre_archivo: str = "") -> dict:
-    """Extrae y estructura los datos con las 17 columnas de tu tabla."""
+    """Extrae y estructura los datos con el formato exacto de tu tabla."""
     datos = {
         "ORIGEN": "",
         "ADUANA DESTINO": "",
@@ -232,24 +241,44 @@ def procesar_manifiesto(texto: str, nombre_archivo: str = "") -> dict:
     return datos
 
 # ==============================================================================
-# 3. CONECTOR DE GOOGLE SHEETS
+# 3. CONECTOR DE GOOGLE SHEETS (SECRETS & LOCAL)
 # ==============================================================================
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
 
-def conectar_google_sheets(creds_path, sheet_url: str):
-    """Inicializa la conexión con Google Sheets usando la cuenta de servicio."""
-    creds = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
+def conectar_google_sheets(sheet_url: str):
+    """Inicializa la conexión con Google Sheets tanto en Streamlit Cloud como en Local."""
+    creds = None
+    
+    # 1. Intentar cargar desde Secrets de Streamlit Cloud
+    try:
+        if "gcp_service_account" in st.secrets:
+            creds_info = dict(st.secrets["gcp_service_account"])
+            if "private_key" in creds_info:
+                creds_info["private_key"] = creds_info["private_key"].replace("\\n", "\n")
+            creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+    except Exception:
+        pass
+    
+    # 2. Si no está en secrets, intentar cargar credentials.json local
+    if creds is None:
+        ruta = obtener_ruta_credenciales()
+        if ruta:
+            creds = Credentials.from_service_account_file(ruta, scopes=SCOPES)
+    
+    if creds is None:
+        raise Exception("No se encontraron credenciales válidas en Streamlit Secrets ni en credentials.json.")
+        
     client = gspread.authorize(creds)
     if sheet_url.startswith("https://"):
         return client.open_by_url(sheet_url)
     return client.open(sheet_url)
 
-def guardar_en_google_sheets(df: pd.DataFrame, creds_path, sheet_target: str, worksheet_name: str = "Hoja 1"):
+def guardar_en_google_sheets(df: pd.DataFrame, sheet_target: str, worksheet_name: str = "Hoja 1"):
     """Guarda o añade los registros a la hoja de cálculo asegurando encabezados en la Fila 1."""
-    spreadsheet = conectar_google_sheets(creds_path, sheet_target)
+    spreadsheet = conectar_google_sheets(sheet_target)
     
     try:
         ws = spreadsheet.worksheet(worksheet_name)
@@ -316,15 +345,13 @@ def guardar_en_google_sheets(df: pd.DataFrame, creds_path, sheet_target: str, wo
 # ==============================================================================
 st.title("🚚 Registro de Cargas y Control de Camiones")
 st.markdown("""
-Sube tus **Manifiestos de Carga (MIC/DTA, CRT)** en PDF. La app extrae automáticamente los datos según la estructura de tu planilla y los sincroniza con tu **Google Sheet**.
+Sube tus **Manifiestos de Carga (MIC/DTA, CRT)** en PDF. La app extrae automáticamente todos los campos según la estructura de tu planilla y los sincroniza con tu **Google Sheet**.
 """)
 
 if "registros" not in st.session_state:
     st.session_state.registros = []
 
-# Detectar credenciales automáticamente
-ruta_credenciales = obtener_ruta_credenciales()
-creds_disponibles = ruta_credenciales is not None
+creds_disponibles = verificar_credenciales_disponibles()
 
 # Barra lateral: Configuración de Google Sheets
 with st.sidebar:
@@ -337,10 +364,10 @@ with st.sidebar:
     nombre_pestana = st.text_input("Nombre de la Pestaña:", value="Hoja 1")
     
     if creds_disponibles:
-        st.success("✅ Archivo `credentials.json` listo.")
+        st.success("✅ Credenciales de Google activas.")
     else:
-        st.warning("⚠️ No se encontró `credentials.json` en la carpeta.")
-        st.caption("Verifica que el archivo esté en la misma carpeta que `app.py`.")
+        st.warning("⚠️ No se encontraron credenciales de Google.")
+        st.caption("Configura Secrets en Streamlit Cloud o coloca credentials.json en local.")
 
     st.divider()
     if st.button("🗑️ Limpiar registros", use_container_width=True):
@@ -399,13 +426,12 @@ if st.session_state.registros:
             if not sheet_url:
                 st.error("Por favor, ingresa el enlace de tu Google Sheet en la barra lateral.")
             elif not creds_disponibles:
-                st.error("Falta el archivo `credentials.json` para autenticar con Google Sheets.")
+                st.error("Faltan las credenciales para autenticar con Google Sheets.")
             else:
                 try:
                     with st.spinner("Sincronizando con tu Google Sheet..."):
                         filas_guardadas = guardar_en_google_sheets(
                             pd.DataFrame(st.session_state.registros),
-                            ruta_credenciales,
                             sheet_url,
                             nombre_pestana
                         )
