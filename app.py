@@ -3,6 +3,7 @@ import hashlib
 import os
 import re
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import pandas as pd
 import pypdf
 import streamlit as st
@@ -399,16 +400,43 @@ def conectar_google_sheets(sheet_url: str):
         return client.open_by_url(sheet_url)
     return client.open(sheet_url)
 
-def guardar_en_google_sheets(df: pd.DataFrame, sheet_target: str, worksheet_name: str = "Septiembre"):
+def ahora_argentina():
+    return datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
+
+
+def nombre_hoja_mensual(fecha=None):
+    fecha = fecha if fecha is not None else ahora_argentina()
+    if isinstance(fecha, datetime) and fecha.tzinfo is not None:
+        fecha = fecha.astimezone(ZoneInfo("America/Argentina/Buenos_Aires"))
+    meses = ("Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+             "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre")
+    # La pestaña original del usuario corresponde a septiembre de 2026.
+    if (fecha.year, fecha.month) == (2026, 9):
+        return "Septiembre"
+    return f"{meses[fecha.month - 1]} {fecha.year}"
+
+
+def obtener_o_crear_pestana(spreadsheet, nombre, columnas):
+    try:
+        return spreadsheet.worksheet(nombre)
+    except gspread.exceptions.WorksheetNotFound:
+        try:
+            return spreadsheet.add_worksheet(title=nombre, rows=1000, cols=max(26, len(columnas)))
+        except gspread.exceptions.APIError as error:
+            # Otra sesión puede haber creado el mismo mes entre ambas llamadas.
+            try:
+                return spreadsheet.worksheet(nombre)
+            except gspread.exceptions.WorksheetNotFound:
+                raise error
+
+
+def guardar_en_google_sheets(df: pd.DataFrame, sheet_target: str, worksheet_name: str = None):
     """Agrega cargas y completa los CRT de un MIC existente sin pisar otros datos."""
     spreadsheet = conectar_google_sheets(sheet_target)
-    try:
-        ws = spreadsheet.worksheet(worksheet_name)
-    except gspread.exceptions.WorksheetNotFound:
-        raise ValueError(f"No existe la pestaña '{worksheet_name}'. Revisá su nombre antes de guardar.") from None
-
-    valores_existentes = ws.get_all_values()
     columnas = list(df.columns)
+    worksheet_name = worksheet_name or nombre_hoja_mensual()
+    ws = obtener_o_crear_pestana(spreadsheet, worksheet_name, columnas)
+    valores_existentes = ws.get_all_values()
     if not any(str(celda).strip() for fila in valores_existentes for celda in fila):
         ws.update(values=[columnas], range_name="A1")
         valores_existentes = [columnas]
@@ -557,6 +585,11 @@ for clave, valor in (("archivos_procesados", set()), ("avisos_carga", []), ("rev
         st.session_state[clave] = valor
 
 creds_disponibles = verificar_credenciales_disponibles()
+mes_actual = nombre_hoja_mensual()
+if "mes_registros" not in st.session_state or not st.session_state.registros:
+    st.session_state.mes_registros = mes_actual
+nombre_pestana = st.session_state.mes_registros
+pendientes_mes_anterior = nombre_pestana != mes_actual
 
 # Barra lateral: Configuración de Google Sheets
 with st.sidebar:
@@ -566,7 +599,10 @@ with st.sidebar:
         value="https://docs.google.com/spreadsheets/d/1-9AkVFnZkx1miHjsh5USFifcfFp-o6-1mMtJ94KfyQ8/edit?usp=sharing",
         help="Enlace configurado a tu planilla de Google Sheets."
     )
-    nombre_pestana = st.text_input("Nombre de la Pestaña:", value="Septiembre")
+    st.info(f"📅 Pestaña de estas cargas: **{nombre_pestana}**")
+    st.caption("Se elige por el mes de carga, con horario de Argentina. Si la pestaña no existe, se crea al guardar con las mismas 17 columnas.")
+    if pendientes_mes_anterior:
+        st.warning(f"Cambió el mes. Guardá o descargá estas cargas de {nombre_pestana} y después usá Limpiar registros para comenzar {mes_actual}.")
     
     if creds_disponibles:
         st.success("✅ Credenciales de Google activas.")
@@ -581,6 +617,7 @@ with st.sidebar:
         st.session_state.avisos_carga = []
         st.session_state.revision_cargas += 1
         st.session_state.cargador_version += 1
+        st.session_state.mes_registros = mes_actual
         st.rerun()
 
 # 1. ZONA DRAG & DROP
@@ -589,11 +626,12 @@ archivos = st.file_uploader(
     "Arrastra tus archivos PDF aquí (puedes subir varios a la vez):",
     type=["pdf"],
     accept_multiple_files=True,
+    disabled=pendientes_mes_anterior,
     key=f"manifiestos_{st.session_state.cargador_version}",
     help="Arrastra tus PDFs de MIC/DTA o Manifiestos de carga."
 )
 
-if archivos:
+if archivos and not pendientes_mes_anterior:
     registros_antes = [dict(fila) for fila in st.session_state.registros]
     nuevos, avisos = cargar_archivos(archivos, st.session_state.registros, st.session_state.archivos_procesados)
     st.session_state.avisos_carga.extend(avisos)
@@ -608,7 +646,7 @@ if st.session_state.avisos_carga:
             st.warning(aviso)
 
 # 2. PLANILLA INTERACTIVA
-st.subheader("📊 2. Planilla de Cargas del Mes")
+st.subheader(f"📊 2. Planilla de Cargas — {nombre_pestana}")
 
 if st.session_state.registros:
     df_actual = pd.DataFrame(st.session_state.registros)
@@ -650,7 +688,7 @@ if st.session_state.registros:
                             sheet_url,
                             nombre_pestana
                         )
-                        st.success(f"🎉 ¡Éxito! Se sincronizaron {filas_guardadas} fila(s) en tu Google Sheet.")
+                        st.success(f"🎉 ¡Éxito! Se sincronizaron {filas_guardadas} fila(s) en la pestaña {nombre_pestana}.")
                         st.markdown(f"👉 [Abrir Google Sheet en el navegador]({sheet_url})")
                 except Exception as err:
                     st.error(f"Error al conectar con Google Sheets: {err}")
@@ -664,7 +702,7 @@ if st.session_state.registros:
         st.download_button(
             label="Descargar Planilla Excel (.xlsx)",
             data=out_excel.getvalue(),
-            file_name=f"Registro_Cargas_{datetime.now().strftime('%Y_%m')}.xlsx",
+            file_name=f"Registro_Cargas_{nombre_pestana.replace(' ', '_')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True
         )
