@@ -1,4 +1,5 @@
 import io
+import hashlib
 import os
 import re
 from datetime import datetime
@@ -57,187 +58,309 @@ st.set_page_config(
 # 2. MOTOR DE EXTRACCIÓN AVANZADO (MIC/DTA & CRT)
 # ==============================================================================
 def extraer_texto_pdf(archivo_pdf) -> str:
-    """Extrae el contenido textual del PDF subido."""
-    try:
-        lector = pypdf.PdfReader(archivo_pdf)
-        texto = "\n".join([pagina.extract_text() or "" for pagina in lector.pages])
-        return texto
-    except Exception as e:
-        st.error(f"Error al leer el archivo PDF: {e}")
-        return ""
+    """Lee texto seleccionable; los errores los muestra la interfaz por archivo."""
+    archivo_pdf.seek(0)
+    lector = pypdf.PdfReader(archivo_pdf)
+    return "\n".join(pagina.extract_text() or "" for pagina in lector.pages).strip()
 
-def limpiar_campo(txt: str) -> str:
-    """Limpia encabezados y títulos de campos aduaneros."""
-    if not txt:
-        return ""
-    txt = re.sub(
-        r'^(?:(?:\d{1,2}\.?\s*)?(?:Remitente|Remetente|Destinatario|Destinat[aá]rio|Consignatario|Aduana|Ciudad|Cidade|Valor|Flete|Frete|Fecha|Data|Moneda|Moeda|Nombre|Nome)[^\n\r\:]*[:\/\-\.]?)\s*', 
-        '', txt, flags=re.IGNORECASE
+"""Extracción conservadora de manifiestos con texto, sin servicios externos."""
+
+import re
+import unicodedata
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
+
+
+_COLUMNAS_MANIFIESTO = (
+    "ORIGEN", "ADUANA DESTINO", "ADUANA DE SALIDA", "EXPORTADOR", "IMPORTADOR",
+    "fecha", "MIC ELEC.", "CRT", "FACTURA", "VALOR", "FLETE EN REALES", "FRETE",
+    "TRACTOR", "CARRETA", "CHOFER", "DNI", "SEGURO",
+)
+
+
+def _normalizar_busqueda(texto):
+    # Un carácter por carácter mantiene los índices del texto original.
+    return "".join(
+        next((c for c in unicodedata.normalize("NFD", letra) if not unicodedata.combining(c)), letra)
+        for letra in texto
+    ).upper()
+
+
+def _rotulo(patron, numeros=""):
+    prefijo = rf"(?:(?:{numeros})[.)]?\s+)?" if numeros else ""
+    return rf"(?<!\w){prefijo}(?:{patron})(?!\w)"
+
+
+# Los encabezados también delimitan los campos anteriores. No se busca un
+# importe, una patente o una aduana en todo el resto del documento.
+_ROTULOS_MANIFIESTO = [
+    ("ignorar", _rotulo(r"(?:FECHA|DATA)\s*(?:DE\s*)?(?:NACIMIENTO|NASCIMENTO|VENCIMIENTO|VENCIMENTO)")),
+    ("origen", _rotulo(r"ADUANA(?:\s*,?\s*CIUDAD\s*Y\s*PAIS)?\s*(?:DE\s*)?PARTIDA(?:\s*/\s*ALFANDEGA(?:\s*,?\s*CIDADE\s*E\s*PAIS)?\s*DE\s*PARTIDA)?|PAIS\s*DE\s*ORIGEN|ORIGEN", "7|26")),
+    ("destino", _rotulo(r"ADUANA\s*(?:DE\s*)?DESTINO(?:\s*/\s*ALFANDEGA\s*(?:DE\s*)?DESTINO)?|CIUDAD\s*Y\s*PAIS\s*DE\s*DESTINO(?:\s*FINAL)?", "24|8")),
+    ("salida", _rotulo(r"ADUANA\s*(?:DE\s*)?(?:SALIDA|FRONTERA)|PASO\s*FRONTERIZO")),
+    ("ruta", _rotulo(r"RUTA(?:\s*(?:Y\s*PLAZO\s*DE\s*TRANSPORTE|PREVISTA|DE\s*TRANSPORTE))?|ITINERARIO", "40")),
+    ("exportador", _rotulo(r"(?:REMITENTE|REMETENTE|EXPORTADOR)(?:\s*/\s*(?:REMITENTE|REMETENTE|EXPORTADOR))?", "33|6|1")),
+    ("importador", _rotulo(r"(?:DESTINATARIO|IMPORTADOR)(?:\s*/\s*(?:DESTINATARIO|IMPORTADOR))?", "34|7|4")),
+    ("fecha", _rotulo(r"F\.?\s*OFIC\.?|(?:FECHA|DATA)(?:\s*(?:DE\s*)?(?:EMISION|EMISSAO|OFICIALIZACION))?")),
+    ("crt", _rotulo(r"(?:N[°º?O.]?\s*(?:DE\s*)?|NUMEROS?\s*(?:DE\s*)?)CARTAS?\s*DE\s*PORTE|CRTS?", "23")),
+    ("crt", r"(?<!\w)2[.)]?\s+NUMERO(?!\w)"),
+    ("factura", _rotulo(r"FACTURA(?:\s*COMERCIAL)?|FATURA(?:\s*COMERCIAL)?|INVOICE")),
+    ("valor", _rotulo(r"(?:MONEDA\s*Y\s*)?VALOR\s*FO[BT]", "27|15")),
+    ("valor", r"(?<!\w)14[.)]?\s+VALOR(?!\w)"),
+    ("reales", _rotulo(r"(?:FLETE|FRETE)\s*(?:(?:EN|EM)\s*)?(?:REALES|REAIS|BRL|R\$)", "28")),
+    ("flete", _rotulo(r"(?:FLETE|FRETE)(?:\s*/\s*(?:FLETE|FRETE))?(?:\s*(?:EN|EM)\s*(?:US[S$]|USD|DOLARES))?", "28")),
+    ("seguro", _rotulo(r"SEGURO(?:\s*(?:/|X)\s*SEGURO)?(?:\s*(?:(?:EN|EM)\s*)?(?:US[S$]|USD))?", "29")),
+    ("tractor", _rotulo(r"PLACA\s*(?:DE[L]?\s*)?(?:CAMION|CAMINHAO|TRACTOR)|PATENTE\s*(?:DE[L]?\s*)?(?:CAMION|TRACTOR)|TRACTOR", "11|18")),
+    ("carreta", _rotulo(r"SEMIR?REMOLQUE|SEMIREMOLQUE|SEMI[-\s]?REBOQUE|CARRETA|ACOPLADO", "15|20")),
+    ("chofer", _rotulo(r"CONDUCTOR(?:\s*1)?|CHOFER|MOTORISTA")),
+    ("dni", _rotulo(r"DOC(?:UMENTO)?(?:\s*(?:DE\s*IDENTIDAD|DEL\s*CHOFER))?|DNI|CEDULA(?:\s*DE\s*IDENTIDAD)?")),
+    ("ignorar", _rotulo(r"MIC(?:\s*ELEC(?:TRONICO)?\.?)?(?:\s*/\s*DTA)?|CONSIGNATARIO|PESO(?:\s*BRUTO|\s*NETO)?|BULTOS|PRECINTOS?|MARCAS\s*Y\s*NUMEROS|DESCRIPCION\s*DE\s*(?:LA\s*)?MERCADERIA|GASTOS\s*A\s*PAGAR|OTROS\s*GASTOS|TRANSPORTISTA|TRANSPORTADOR|PERMISO|CUIT|CNPJ|RUT", "35|30|31|32|36|37|38|39|15|1|2|3|4|5")),
+]
+_ENCABEZADOS_MANIFIESTO = re.compile("|".join(
+    rf"(?P<c{i}>{patron})" for i, (_, patron) in enumerate(_ROTULOS_MANIFIESTO)
+))
+_NUMERO_IMPORTE = r"[+-]?(?:\d{1,3}(?:[ \u00a0]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d+)*)"
+_MONEDAS = r"(?:USD|US\$|U\$S|USS|BRL|R\$|EUR|ARS|REALES|REAIS|PESOS)"
+
+
+def _secciones_manifiesto(texto):
+    normalizado = _normalizar_busqueda(texto)
+    matches = list(_ENCABEZADOS_MANIFIESTO.finditer(normalizado))
+    secciones = {}
+    for indice, match in enumerate(matches):
+        tipo = _ROTULOS_MANIFIESTO[int(match.lastgroup[1:])][0]
+        fin = matches[indice + 1].start() if indice + 1 < len(matches) else len(texto)
+        contenido = texto[match.end():fin]
+        # Un campo numerado desconocido en una línea nueva también es límite.
+        corte = re.search(r"(?m)^\s*\d{1,2}[.)]?\s+[A-Za-zÁÉÍÓÚÑÜáéíóúñü]", contenido)
+        if corte:
+            contenido = contenido[:corte.start()]
+        secciones.setdefault(tipo, []).append((texto[match.start():match.end()], contenido))
+    return secciones
+
+
+def _primera_linea_campo(contenido):
+    contenido = re.sub(r"^\s*[:/\-–.]*\s*", "", contenido)
+    contenido = re.sub(r"^\([^\n)]*\)\s*[:/\-–.]*\s*", "", contenido)
+    for linea in contenido.splitlines():
+        linea = linea.strip(" \t:/–")
+        if not linea:
+            continue
+        if _normalizar_busqueda(linea).strip(" .:-") in {
+            "NOMBRE Y DOMICILIO", "NOME E ENDERECO", "NOMBRE Y DIRECCION",
+            "NOMBRE", "NOME", "NOMBRE Y DOMICILIO / NOME E ENDERECO",
+        }:
+            continue
+        return re.sub(r"\s+", " ", linea)
+    return ""
+
+
+def _localidad_campo(contenido, quitar_pais=False):
+    for linea in contenido.splitlines():
+        linea = linea.strip(" \t:/–")
+        if not linea or not re.search(r"[A-Za-zÁÉÍÓÚÑáéíóúñ]", linea):
+            continue
+        linea = re.sub(r"^\d+\s*[-.]?\s*", "", linea)
+        if quitar_pais:
+            linea = re.sub(r"\s*[-/]\s*(?:ARGENTINA|BRASIL|CHILE|URUGUAY|PARAGUAY|BOLIVIA)\s*$", "", linea, flags=re.I)
+        return re.sub(r"\s+", " ", linea).strip()
+    return ""
+
+
+def _decimal_manifiesto(token):
+    """Admite miles locales/internacionales; rechaza agrupaciones ambiguas."""
+    token = re.sub(r"[ \u00a0]", "", token)
+    signo = ""
+    if token.startswith(("+", "-")):
+        signo, token = token[0], token[1:]
+    if not token or not re.fullmatch(r"\d+(?:[.,]\d+)*", token):
+        return None
+    if "." in token and "," in token:
+        decimal = "." if token.rfind(".") > token.rfind(",") else ","
+        miles = "," if decimal == "." else "."
+        entero, fraccion = token.rsplit(decimal, 1)
+        if decimal in entero or len(fraccion) not in (1, 2):
+            return None
+        grupos = entero.split(miles)
+        if not (1 <= len(grupos[0]) <= 3 and all(len(g) == 3 for g in grupos[1:])):
+            return None
+        canonico = "".join(grupos) + "." + fraccion
+    elif "." in token or "," in token:
+        separador = "." if "." in token else ","
+        grupos = token.split(separador)
+        if len(grupos) == 2 and len(grupos[-1]) in (1, 2):
+            canonico = grupos[0] + "." + grupos[1]
+        elif 1 <= len(grupos[0]) <= 3 and all(len(g) == 3 for g in grupos[1:]):
+            canonico = "".join(grupos)
+        else:
+            return None
+    else:
+        canonico = token
+    try:
+        return Decimal(signo + canonico).quantize(Decimal("0.01"))
+    except InvalidOperation:
+        return None
+
+
+def _importe_campo(rotulo, contenido, moneda):
+    # El valor debe estar inmediatamente debajo/junto al encabezado. Una nota
+    # posterior con otro importe no puede completar un campo que estaba vacío.
+    lineas = [linea.strip(" \t:") for linea in contenido.splitlines() if linea.strip(" \t:")]
+    if not lineas:
+        return None
+    texto = _normalizar_busqueda(lineas[0])
+    if re.fullmatch(_MONEDAS, texto) and len(lineas) > 1:
+        texto += " " + _normalizar_busqueda(lineas[1])
+    todas = list(re.finditer(_MONEDAS, texto))
+    deseada = r"(?:USD|US\$|U\$S|USS)" if moneda == "USD" else r"(?:BRL|R\$|REALES|REAIS)"
+    # Si se declara una moneda en el valor, solamente se acepta la pedida.
+    if todas:
+        patrones = (
+            rf"{deseada}\s*[:$]?\s*({_NUMERO_IMPORTE})",
+            rf"({_NUMERO_IMPORTE})\s*{deseada}",
+        )
+        for patron in patrones:
+            match = re.fullmatch(patron, texto)
+            if match:
+                valor = _decimal_manifiesto(match.group(1))
+                if valor is not None:
+                    return valor
+        return None
+    rotulo_normalizado = _normalizar_busqueda(rotulo)
+    moneda_rotulo = re.search(_MONEDAS, rotulo_normalizado)
+    if moneda_rotulo and not re.fullmatch(deseada, moneda_rotulo.group()):
+        return None
+    # Primera línea con contenido, evitando buscar números en notas posteriores.
+    match = re.fullmatch(rf"\s*[$:]?\s*({_NUMERO_IMPORTE})\s*", texto)
+    return _decimal_manifiesto(match.group(1)) if match else None
+
+
+def _formatear_importe(valor, moneda):
+    return moneda + " " + format(valor, ",.2f").replace(",", "@").replace(".", ",").replace("@", ".")
+
+
+def _identificador_campo(contenido):
+    linea = _primera_linea_campo(contenido)
+    linea = re.sub(r"^(?:NRO\.?|NR\.?|NUMERO|N[°º?O.]?)\s*[:.-]?\s*", "", linea, flags=re.I)
+    match = re.match(r"([A-Za-z0-9]+(?:[./-][A-Za-z0-9]+)*)", linea)
+    if match and re.search(r"\d", match.group(1)):
+        return match.group(1)
+    return ""
+
+
+def _mic_manifiesto(texto):
+    normalizado = _normalizar_busqueda(texto)
+    match = re.search(
+        r"(?<![A-Z0-9])(?:\d{2}[ \t]*AR[ \t]*\d{6}[ \t]*[A-Z]|\d{2}[ \t]*\d{3}[ \t]*[A-Z]{3,5}[ \t]*\d{4,8}[A-Z0-9]?)(?![A-Z0-9])",
+        normalizado,
     )
-    txt = re.sub(r'^[\s\:\/\-\#\.]+', '', txt)
-    return re.sub(r'\s+', ' ', txt).strip()
+    return re.sub(r"\s+", "", match.group()) if match else ""
+
+
+def _crts_campo(contenido):
+    """Recoge los identificadores de un campo CRT, incluso en varias líneas."""
+    encontrados = []
+    for linea in contenido.splitlines():
+        linea = linea.strip(" \t:/–")
+        linea = re.sub(r"^(?:NROS?\.?|NRS?\.?|NUMEROS?|N[°º?O.]?)\s*[:.-]?\s*", "", linea, flags=re.I)
+        if not linea:
+            continue
+        # Una barra entre dos códigos AR completos separa CRT, mientras que
+        # una barra interna de otro identificador conserva su significado.
+        linea = re.sub(r"(?<=\d)/(?=(?:038[.-]?)?AR\d)", ";", linea, flags=re.I)
+        tokens = re.split(r"\s*[,;|]\s*|\s+/\s+|\s+(?:Y|E|AND)\s+|\s+", linea, flags=re.I)
+        numeros = []
+        for token in tokens:
+            token = token.strip().upper()
+            if (not re.fullmatch(r"[A-Z0-9]+(?:[./-][A-Z0-9]+)*", token)
+                    or not re.search(r"\d", token)
+                    or len(re.sub(r"[^A-Z0-9]", "", token)) < 4):
+                # Detenerse ante descripciones o notas: sus números no son CRT.
+                return encontrados
+            token = re.sub(r"^038[.-]?(?=AR\d)", "", token)
+            numeros.append(token)
+        for numero in numeros:
+            if numero not in encontrados:
+                encontrados.append(numero)
+    return encontrados
+
 
 def procesar_manifiesto(texto: str, nombre_archivo: str = "") -> dict:
-    """Extrae y estructura los datos con el formato exacto de tu tabla."""
-    datos = {
-        "ORIGEN": "",
-        "ADUANA DESTINO": "",
-        "ADUANA DE SALIDA": "",
-        "EXPORTADOR": "",
-        "IMPORTADOR": "",
-        "fecha": "",
-        "MIC ELEC.": "",
-        "CRT": "",
-        "FACTURA": "",
-        "VALOR": "",
-        "FLETE EN REALES": "",
-        "FRETE": "",
-        "TRACTOR": "",
-        "CARRETA": "",
-        "CHOFER": "",
-        "DNI": "",
-        "SEGURO": ""
-    }
-
-    if not texto:
-        m_fn = re.search(r'(\d{2}AR\d{6}[A-Z]|\d{2}\d{3}[A-Z]{3,5}\d{4,8}[A-Z0-9]?)', nombre_archivo, re.IGNORECASE)
-        if m_fn:
-            datos["MIC ELEC."] = m_fn.group(1).upper()
+    """Devuelve las 17 columnas; un dato no encontrado permanece vacío."""
+    datos = dict.fromkeys(_COLUMNAS_MANIFIESTO, "")
+    texto = texto or ""
+    datos["MIC ELEC."] = _mic_manifiesto(texto) or _mic_manifiesto(nombre_archivo or "")
+    if not texto.strip():
         return datos
+    secciones = _secciones_manifiesto(texto)
 
-    # 1. ORIGEN (Campo 7 o 26)
-    m_orig = re.search(r'(?:7\s*Aduana[^\n\r]*partida[\s\S]*?)([A-Z\s]{4,20})-(?:ARGENTINA|BRASIL|CHILE|URUGUAY)', texto, re.IGNORECASE)
-    if m_orig:
-        lineas_o = [l.strip() for l in m_orig.group(1).split('\n') if len(l.strip()) > 3]
-        if lineas_o:
-            datos["ORIGEN"] = lineas_o[-1]
-    if not datos["ORIGEN"]:
-        datos["ORIGEN"] = "MENDOZA"
+    for tipo, columna in (("exportador", "EXPORTADOR"), ("importador", "IMPORTADOR"), ("chofer", "CHOFER")):
+        for _, contenido in secciones.get(tipo, []):
+            valor = _primera_linea_campo(contenido)
+            if valor:
+                datos[columna] = valor
+                break
+    for tipo, columna in (("origen", "ORIGEN"), ("destino", "ADUANA DESTINO"), ("salida", "ADUANA DE SALIDA")):
+        for _, contenido in secciones.get(tipo, []):
+            valor = _localidad_campo(contenido, quitar_pais=(tipo == "origen"))
+            if valor:
+                datos[columna] = valor
+                break
+    if not datos["ADUANA DE SALIDA"]:
+        for _, contenido in secciones.get("ruta", []):
+            match = re.search(r"\b(PASO DE LOS LIBRES|IGUAZU|CRISTO REDENTOR|SAN JAVIER|SANTO TOME|GUALEGUAYCHU|CLORINDA|POCITOS|LA QUIACA|PTM)\b", _normalizar_busqueda(contenido))
+            if match:
+                datos["ADUANA DE SALIDA"] = match.group(1)
+                break
 
-    # 2. ADUANA DESTINO (Campo 24 o Campo 8)
-    m_ad_dest = re.search(r'(?:24\s*Aduana\s*de\s*destino[^\n\r]*[\n\r]+)([^\n\r]{3,60})', texto, re.IGNORECASE)
-    if m_ad_dest:
-        dest_val = m_ad_dest.group(1).strip()
-        dest_val = re.sub(r'^\d+\s*', '', dest_val).rstrip('-').strip()
-        datos["ADUANA DESTINO"] = dest_val
-    else:
-        m_ad_dest8 = re.search(r'(?:8\s*Ciudad\s*y\s*pais\s*de\s*destino\s*final[\s\S]*?)([A-Z\s\-]{3,30}-[A-Z\s]{3,30})', texto, re.IGNORECASE)
-        if m_ad_dest8:
-            datos["ADUANA DESTINO"] = m_ad_dest8.group(1).strip()
+    for _, contenido in secciones.get("fecha", []):
+        match = re.search(r"(?<!\d)(\d{1,2}[/.\-]\d{1,2}[/.\-](?:\d{4}|\d{2}))(?!\d)", _primera_linea_campo(contenido))
+        if match:
+            partes = re.split(r"[/.\-]", match.group(1))
+            try:
+                fecha = datetime.strptime("/".join(partes), "%d/%m/%Y" if len(partes[2]) == 4 else "%d/%m/%y")
+            except ValueError:
+                continue
+            datos["fecha"] = fecha.strftime("%d/%m/%Y")
+            break
 
-    # 3. ADUANA DE SALIDA (Frontera en ruta Campo 40)
-    m_salida = re.search(r'(PASO DE LOS LIBRES|IGUAZU|CRISTO REDENTOR|SAN JAVIER|SANTO TOME|GUALEGUAYCHU|CLORINDA|POCITOS|LA QUIACA|PTM)', texto, re.IGNORECASE)
-    if m_salida:
-        datos["ADUANA DE SALIDA"] = m_salida.group(1).strip().upper()
-    else:
-        datos["ADUANA DE SALIDA"] = datos["ORIGEN"]
+    crts = []
+    for _, contenido in secciones.get("crt", []):
+        for numero in _crts_campo(contenido):
+            if numero not in crts:
+                crts.append(numero)
+    datos["CRT"] = "; ".join(crts)
+    for _, contenido in secciones.get("factura", []):
+        valor = _identificador_campo(contenido)
+        if valor:
+            datos["FACTURA"] = valor
+            break
+    for tipo, columna, moneda in (("valor", "VALOR", "USD"), ("flete", "FRETE", "USD"), ("reales", "FLETE EN REALES", "BRL"), ("seguro", "SEGURO", "USD")):
+        for rotulo, contenido in secciones.get(tipo, []):
+            valor = _importe_campo(rotulo, contenido, moneda)
+            if valor is not None:
+                datos[columna] = format(valor, ".2f") if columna == "SEGURO" else _formatear_importe(valor, moneda)
+                break
+    if not datos["FLETE EN REALES"]:
+        for rotulo, contenido in secciones.get("flete", []):
+            if re.search(r"BRL|R\$|REALES|REAIS", _normalizar_busqueda(contenido)):
+                valor = _importe_campo(rotulo, contenido, "BRL")
+                if valor is not None:
+                    datos["FLETE EN REALES"] = _formatear_importe(valor, "BRL")
+                    break
 
-    # 4. EXPORTADOR (Campo 33 o Campo 6 / CRT 1)
-    m_exp_33 = re.search(r'(?:33\s*Remitente[^\n\r]*[\n\r]+)([\s\S]*?)(?=(?:34\s*Destinatario|34\.|\Z))', texto, re.IGNORECASE)
-    if m_exp_33:
-        lineas = [l.strip() for l in m_exp_33.group(1).strip().split('\n') if l.strip()]
-        if lineas:
-            datos["EXPORTADOR"] = lineas[0].replace("?", "Ñ").replace("VI EDOS", "VIÑEDOS").replace("VI?EDOS", "VIÑEDOS")
-    else:
-        m_exp_gen = re.search(r'(?:Remitente|Exportador)[^\n\r\:]*[:\/\-\.]?\s*\n?([^\n\r;]{3,70})', texto, re.IGNORECASE)
-        if m_exp_gen:
-            datos["EXPORTADOR"] = limpiar_campo(m_exp_gen.group(1)).replace("?", "Ñ")
-
-    # 5. IMPORTADOR (Campo 34 o Campo 7 / CRT 4)
-    m_imp_34 = re.search(r'(?:34\s*Destinatario[^\n\r]*[\n\r]+)([\s\S]*?)(?=(?:35\s*Consignatario|35\.|\Z))', texto, re.IGNORECASE)
-    if m_imp_34:
-        lineas = [l.strip() for l in m_imp_34.group(1).strip().split('\n') if l.strip()]
-        if lineas:
-            datos["IMPORTADOR"] = lineas[0]
-    else:
-        m_imp_gen = re.search(r'(?:Destinatario|Destinat[aá]rio|Importador)[^\n\r\:]*[:\/\-\.]?\s*\n?([^\n\r;]{3,70})', texto, re.IGNORECASE)
-        if m_imp_gen:
-            datos["IMPORTADOR"] = limpiar_campo(m_imp_gen.group(1))
-
-    # 6. FECHA (Formato D/M/AAAA)
-    m_fec = re.search(r'(?:F\.?\s*Ofic|Fecha(?:\s*Emisi[oó]n)?|Data(?:\s*de\s*emiss[aã]o)?)\s*[:\/\-\.]?\s*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.](?:20)?\d{2,4})', texto, re.IGNORECASE)
-    if m_fec:
-        datos["fecha"] = m_fec.group(1).strip()
-    else:
-        m_fecha_gen = re.search(r'\b(\d{2}[\/\-\.]\d{2}[\/\-\.]\d{4})\b', texto)
-        if m_fecha_gen:
-            datos["fecha"] = m_fecha_gen.group(1).strip()
-
-    # 7. MIC ELEC. (26AR348605N / 26AR349197U)
-    m_mic = re.search(r'\b(\d{2}AR\d{6}[A-Z]|\d{2}\s*\d{3}\s*[A-Z]{3,5}\s*\d{4,8}\s*[A-Z0-9]?)\b', texto, re.IGNORECASE)
-    if m_mic:
-        datos["MIC ELEC."] = m_mic.group(1).replace(" ", "").upper()
-    elif nombre_archivo:
-        m_fn = re.search(r'(\d{2}AR\d{6}[A-Z])', nombre_archivo, re.IGNORECASE)
-        if m_fn:
-            datos["MIC ELEC."] = m_fn.group(1).upper()
-
-    # 8. CRT (Eliminando prefijo '038' o '038.')
-    m_crt = re.search(r'(?:23\s*N[°\?ºo\.]?\s*carta\s*de\s*porte[^\n\r]*[\n\r]+|2\s*Numero[^\n\r]*[\n\r]+)([0-9A-Z\.\-]{8,25})', texto, re.IGNORECASE)
-    if m_crt:
-        crt_raw = m_crt.group(1).strip()
-        crt_limpio = re.sub(r'^038[\.\-]?', '', crt_raw)
-        datos["CRT"] = crt_limpio
-
-    # 9. FACTURA (De la descripción campo 38 o CRT)
-    m_fac = re.search(r'(?:FATURA|FACTURA\s*COMERCIAL|FACTURA|INVOICE)\s*(?:N[°ºo\.]?|NR\.?|NRO\.?|:)?\s*([E0-9A-Z\-\/]{4,25})', texto, re.IGNORECASE)
-    if m_fac:
-        val_f = m_fac.group(1).strip()
-        if val_f.upper() not in ['COMERCIAL', 'NR', 'NRO', 'NUMERO']:
-            datos["FACTURA"] = val_f
-    if not datos["FACTURA"]:
-        m_fac_alt = re.search(r'(?:FACTURA\s*COMERCIAL\s*NR\.?\s*)([0-9A-Z\-\/]{4,25})', texto, re.IGNORECASE)
-        if m_fac_alt:
-            datos["FACTURA"] = m_fac_alt.group(1).strip()
-
-    # 10. VALOR (FOB)
-    m_val = re.search(r'(?:27\s*Valor\s*FO[BT]|Valor\s*FO[BT]|15\s*Moneda\s*y\s*valor\s*FO[BT]|14\s*Valor)[\s\S]*?(\d{2,7}[\.\,]\d{2})', texto, re.IGNORECASE)
-    if m_val:
-        v_num = m_val.group(1).replace(",", ".")
-        datos["VALOR"] = f"USD {float(v_num):,.2f}".replace(",", "@").replace(".", ",").replace("@", ".")
-
-    # 11. FLETE EN REALES
-    m_reales = re.search(r'(?:BRL|R\$)\s*([\d\.\,]{3,15})', texto, re.IGNORECASE)
-    if m_reales:
-        datos["FLETE EN REALES"] = f"BRL {m_reales.group(1)}"
-
-    # 12. FRETE (FLETE EN USD)
-    m_frete = re.search(r'(?:28\s*Flete|Flete\s*en\s*US[S\$]|Frete\s*em\s*US[S\$]|Flete\s*/\s*Frete|15\s*Gastos\s*a\s*pagar[\s\S]*?Flete)[\s\S]*?(\d{2,7}[\.\,]\d{2})', texto, re.IGNORECASE)
-    if m_frete:
-        fr_num = m_frete.group(1).replace(",", ".")
-        datos["FRETE"] = f"USD {float(fr_num):,.2f}".replace(",", "@").replace(".", ",").replace("@", ".")
-
-    # 13. TRACTOR (Placa)
-    m_trac = re.search(r'(?:11\s*Placa\s*de\s*Camion|18\s*Placa\s*de\s*Camion)[\s\S]*?([A-Z]{3}[0-9][A-Z0-9][0-9]{2}|[A-Z]{3}[0-9]{3,4}|[A-Z]{2}[0-9]{3}[A-Z]{2})', texto, re.IGNORECASE)
-    if m_trac:
-        datos["TRACTOR"] = m_trac.group(1).strip()
-
-    # 14. CARRETA (Semirremolque)
-    m_carr = re.search(r'(?:15[\s\S]*?Semiremolque|Semi-reboque)[\s\S]*?([A-Z]{3}[0-9][A-Z0-9][0-9]{2}|[A-Z]{3}[0-9]{3,4}|[A-Z]{2}[0-9]{3}[A-Z]{2})', texto, re.IGNORECASE)
-    if m_carr:
-        datos["CARRETA"] = m_carr.group(1).strip()
-
-    # 15. CHOFER (Conductor)
-    m_chof = re.search(r'(?:CONDUCTOR\s*1\s*:\s*|CHOFER\s*:\s*)([A-Z\s]{4,40})(?=\s*DOC|\n|\r|\Z)', texto, re.IGNORECASE)
-    if m_chof:
-        datos["CHOFER"] = m_chof.group(1).strip()
-
-    # 16. DNI (Documento del chofer)
-    m_dni = re.search(r'(?:DOC\s*:\s*|DNI\s*:\s*)(?:CI\s*)?([0-9\.\-]{6,20})', texto, re.IGNORECASE)
-    if m_dni:
-        datos["DNI"] = m_dni.group(1).strip()
-
-    # 17. SEGURO (Debajo del Flete en Campo 29 o en tabla de gastos)
-    m_seg29 = re.search(r'(?:29\s*Seguro\s*en\s*US[S\$]|29\s*Seguro)[^\n\r]*[\n\r]+(?:Seguro[^\n\r]*[\n\r]+)?\s*([\d\.\,]{1,8})', texto, re.IGNORECASE)
-    if m_seg29:
-        datos["SEGURO"] = m_seg29.group(1).replace(",", ".")
-    else:
-        m_seg_crt = re.search(r'(?:Seguro\s*/\s*Seguro|SEGURO\s*X\s*SEGURO|SEGURO\s*USD)\s*[:\/\-\.]?\s*(?:USD|US\$|\$)?\s*([\d\.\,]{1,8})', texto, re.IGNORECASE)
-        if m_seg_crt:
-            datos["SEGURO"] = m_seg_crt.group(1).replace(",", ".")
-        else:
-            datos["SEGURO"] = "0.00"
-
+    patente = r"(?<![A-Z0-9])(?:[A-Z]{2}[ \t]*\d{3}[ \t]*[A-Z]{2}|[A-Z]{3}[ \t]*\d[A-Z0-9]\d{2}|[A-Z]{3}[ \t]*\d{3,4})(?![A-Z0-9])"
+    for tipo, columna in (("tractor", "TRACTOR"), ("carreta", "CARRETA")):
+        for _, contenido in secciones.get(tipo, []):
+            match = re.search(patente, _normalizar_busqueda(contenido))
+            if match:
+                datos[columna] = re.sub(r"\s+", "", match.group())
+                break
+    for _, contenido in secciones.get("dni", []):
+        match = re.match(r"\s*[:.-]?\s*(?:CI\s*)?([0-9][0-9.\-]{4,18}[0-9])(?!\d)", contenido, re.I)
+        if match:
+            datos["DNI"] = match.group(1)
+            break
     return datos
 
 # ==============================================================================
@@ -276,80 +399,162 @@ def conectar_google_sheets(sheet_url: str):
         return client.open_by_url(sheet_url)
     return client.open(sheet_url)
 
-def guardar_en_google_sheets(df: pd.DataFrame, sheet_target: str, worksheet_name: str = "Hoja 1"):
-    """Guarda o añade los registros a la hoja de cálculo asegurando encabezados en la Fila 1."""
+def guardar_en_google_sheets(df: pd.DataFrame, sheet_target: str, worksheet_name: str = "Septiembre"):
+    """Agrega cargas y completa los CRT de un MIC existente sin pisar otros datos."""
     spreadsheet = conectar_google_sheets(sheet_target)
-    
     try:
         ws = spreadsheet.worksheet(worksheet_name)
     except gspread.exceptions.WorksheetNotFound:
-        try:
-            ws = spreadsheet.sheet1
-        except Exception:
-            ws = spreadsheet.add_worksheet(title=worksheet_name, rows="1000", cols="25")
-    
+        raise ValueError(f"No existe la pestaña '{worksheet_name}'. Revisá su nombre antes de guardar.") from None
+
     valores_existentes = ws.get_all_values()
     columnas = list(df.columns)
-    
-    # 1. VERIFICAR SI LA FILA 1 CONTIENE NUESTROS ENCABEZADOS
-    tiene_encabezado = False
-    if valores_existentes and len(valores_existentes) > 0:
-        fila_1 = [str(x).strip() for x in valores_existentes[0] if str(x).strip()]
-        if any(h in fila_1 for h in ["MIC ELEC.", "EXPORTADOR", "ORIGEN", "VALOR"]):
-            tiene_encabezado = True
+    if not any(str(celda).strip() for fila in valores_existentes for celda in fila):
+        ws.update(values=[columnas], range_name="A1")
+        valores_existentes = [columnas]
+    encabezados = [str(celda).strip() for celda in valores_existentes[0]]
+    while encabezados and not encabezados[-1]:
+        encabezados.pop()
+    if len(encabezados) != len(columnas) or set(encabezados) != set(columnas):
+        raise ValueError("Los encabezados de la planilla no coinciden con las columnas de la app. Revisalos antes de guardar.")
 
-    hoja_totalmente_vacia = True
-    if valores_existentes:
-        for fila in valores_existentes:
-            if any(str(x).strip() for x in fila):
-                hoja_totalmente_vacia = False
-                break
+    idx_mic, idx_crt = encabezados.index("MIC ELEC."), encabezados.index("CRT")
+    existentes = {}
+    for numero_fila, valores in enumerate(valores_existentes[1:], start=2):
+        valores = valores + [""] * max(0, len(encabezados) - len(valores))
+        mic = normalizar_mic(valores[idx_mic])
+        if mic:
+            existentes.setdefault(mic, []).append((numero_fila, valores))
 
-    # Si no tiene los encabezados, los escribimos en la Fila 1
-    if not tiene_encabezado:
-        if hoja_totalmente_vacia:
-            ws.update(values=[columnas], range_name="A1")
-        else:
-            ws.insert_row(columnas, index=1)
-        
-        try:
-            ws.format("A1:Q1", {
-                "backgroundColor": {"red": 0.35, "green": 0.20, "blue": 0.08},
-                "textFormat": {"bold": True, "foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}},
-                "horizontalAlignment": "CENTER"
-            })
-        except Exception:
-            pass
-
-    # 2. EVITAR DUPLICADOS POR MIC ELEC.
-    valores_actualizados = ws.get_all_values()
-    mic_existentes = set()
-    if len(valores_actualizados) > 1:
-        idx_mic = valores_actualizados[0].index("MIC ELEC.") if "MIC ELEC." in valores_actualizados[0] else 6
-        mic_existentes = {fila[idx_mic] for fila in valores_actualizados[1:] if len(fila) > idx_mic}
-    
-    nuevas_filas = []
+    nuevas_filas, nuevas_por_mic, cambios_crt = [], {}, {}
     for _, row in df.iterrows():
-        nro_mic = str(row.get("MIC ELEC.", ""))
-        if nro_mic and nro_mic in mic_existentes:
+        valores = ["" if pd.isna(row.get(col, "")) else str(row.get(col, "")) for col in encabezados]
+        if not any(valor.strip() for valor in valores):
             continue
-        nuevas_filas.append([str(row.get(col, "")) for col in columnas])
-    
+        mic = normalizar_mic(valores[idx_mic])
+        valores[idx_mic] = mic
+        valores[idx_crt] = combinar_crts(valores[idx_crt])
+        if mic and mic in existentes:
+            if len(existentes[mic]) != 1:
+                raise ValueError(f"El MIC {mic} aparece en varias filas de Google Sheets. Revisá ese duplicado antes de completar sus CRT.")
+            numero_fila, anterior = existentes[mic][0]
+            combinado = combinar_crts(cambios_crt.get(numero_fila, anterior[idx_crt]), valores[idx_crt])
+            if combinado != combinar_crts(anterior[idx_crt]):
+                cambios_crt[numero_fila] = combinado
+            continue
+        if mic and mic in nuevas_por_mic:
+            anterior = nuevas_filas[nuevas_por_mic[mic]]
+            anterior[idx_crt] = combinar_crts(anterior[idx_crt], valores[idx_crt])
+            continue
+        if mic:
+            nuevas_por_mic[mic] = len(nuevas_filas)
+        nuevas_filas.append(valores)
+
+    if cambios_crt:
+        ws.batch_update([
+            {"range": gspread.utils.rowcol_to_a1(numero_fila, idx_crt + 1), "values": [[crt]]}
+            for numero_fila, crt in cambios_crt.items()
+        ], value_input_option="RAW")
     if nuevas_filas:
-        ws.append_rows(nuevas_filas)
-        return len(nuevas_filas)
-    return 0
+        ws.append_rows(nuevas_filas, value_input_option="RAW")
+    return len(nuevas_filas) + len(cambios_crt)
 
 # ==============================================================================
 # 4. INTERFAZ WEB STREAMLIT
 # ==============================================================================
+def normalizar_mic(valor):
+    if valor is None or pd.isna(valor):
+        return ""
+    return re.sub(r"\s+", "", str(valor)).upper()
+
+
+def combinar_crts(*valores):
+    numeros = []
+    for valor in valores:
+        if valor is None or pd.isna(valor):
+            continue
+        for numero in re.split(r"[;,\n]+|\s+/\s+", str(valor)):
+            numero = re.sub(r"^038[.-]?(?=AR\d)", "", numero.strip().upper())
+            if numero and numero not in numeros:
+                numeros.append(numero)
+    return "; ".join(numeros)
+
+
+def cargar_archivos(archivos, registros, procesados):
+    """Procesa cada contenido una sola vez y evita MIC repetidos en el lote."""
+    mics = {normalizar_mic(r.get("MIC ELEC.")) for r in registros}
+    nuevos, avisos = 0, []
+    for archivo in archivos:
+        contenido = archivo.getvalue()
+        identidad = hashlib.sha256(contenido).hexdigest()
+        if identidad in procesados:
+            continue
+        procesados.add(identidad)
+        try:
+            texto = extraer_texto_pdf(io.BytesIO(contenido))
+        except Exception:
+            avisos.append(f"{archivo.name}: no se pudo leer el PDF. Comprobá que no esté dañado o protegido con contraseña.")
+            continue
+        if not texto:
+            avisos.append(f"{archivo.name}: el PDF no tiene texto legible. Si es un escaneo, necesita reconocimiento de texto (OCR). No se agregó una fila vacía.")
+            continue
+        datos = procesar_manifiesto(texto, archivo.name)
+        if not any(datos.values()):
+            avisos.append(f"{archivo.name}: no se reconocieron los campos del manifiesto. No se agregó una fila vacía.")
+            continue
+        mic = normalizar_mic(datos.get("MIC ELEC."))
+        if mic and mic in mics:
+            existente = next(r for r in registros if normalizar_mic(r.get("MIC ELEC.")) == mic)
+            anteriores = combinar_crts(existente.get("CRT"))
+            combinados = combinar_crts(anteriores, datos.get("CRT"))
+            if combinados != anteriores:
+                existente["CRT"] = combinados
+                avisos.append(f"{archivo.name}: se incorporaron los CRT adicionales al MIC {mic} en la misma fila.")
+                continue
+            avisos.append(f"{archivo.name}: el MIC {mic} ya está cargado. No se agregó otra fila.")
+            continue
+        registros.append(datos)
+        if mic:
+            mics.add(mic)
+        nuevos += 1
+        campos_revision = ("MIC ELEC.", "fecha", "EXPORTADOR", "IMPORTADOR", "VALOR", "FRETE", "TRACTOR", "CARRETA", "CHOFER", "DNI")
+        faltantes = [campo for campo in campos_revision if not datos.get(campo)]
+        if faltantes:
+            avisos.append(f"{archivo.name}: revisá los campos sin detectar: {', '.join(faltantes)}.")
+    return nuevos, avisos
+
+
+def aplicar_cambios_editor(registros, cambios):
+    """Aplica una edición a una copia para no repetir altas/bajas al recargar."""
+    columnas = tuple(procesar_manifiesto(""))
+    filas = [dict(fila) for fila in registros]
+    for indice, valores in cambios.get("edited_rows", {}).items():
+        indice = int(indice)
+        if 0 <= indice < len(filas):
+            filas[indice].update({col: "" if valor is None else valor for col, valor in valores.items() if col in columnas})
+    borradas = {int(indice) for indice in cambios.get("deleted_rows", [])}
+    filas = [fila for indice, fila in enumerate(filas) if indice not in borradas]
+    for fila in cambios.get("added_rows", []):
+        filas.append({col: "" if fila.get(col) is None else fila[col] for col in columnas})
+    return filas
+
+
+def confirmar_edicion(clave_editor):
+    cambios = st.session_state.get(clave_editor, {})
+    st.session_state.registros = aplicar_cambios_editor(st.session_state.registros, cambios)
+    st.session_state.revision_cargas += 1
+
+
 st.title("🚚 Registro de Cargas y Control de Camiones")
 st.markdown("""
-Sube tus **Manifiestos de Carga (MIC/DTA, CRT)** en PDF. La app extrae automáticamente todos los campos según la estructura de tu planilla y los sincroniza con tu **Google Sheet**.
+Sube tus **Manifiestos de Carga (MIC/DTA, CRT)** en PDF. La app identifica sus datos y los prepara con las columnas de tu planilla. Revisalos antes de guardarlos en tu **Google Sheet**.
 """)
 
 if "registros" not in st.session_state:
     st.session_state.registros = []
+for clave, valor in (("archivos_procesados", set()), ("avisos_carga", []), ("revision_cargas", 0), ("cargador_version", 0)):
+    if clave not in st.session_state:
+        st.session_state[clave] = valor
 
 creds_disponibles = verificar_credenciales_disponibles()
 
@@ -361,7 +566,7 @@ with st.sidebar:
         value="https://docs.google.com/spreadsheets/d/1-9AkVFnZkx1miHjsh5USFifcfFp-o6-1mMtJ94KfyQ8/edit?usp=sharing",
         help="Enlace configurado a tu planilla de Google Sheets."
     )
-    nombre_pestana = st.text_input("Nombre de la Pestaña:", value="Hoja 1")
+    nombre_pestana = st.text_input("Nombre de la Pestaña:", value="Septiembre")
     
     if creds_disponibles:
         st.success("✅ Credenciales de Google activas.")
@@ -372,6 +577,10 @@ with st.sidebar:
     st.divider()
     if st.button("🗑️ Limpiar registros", use_container_width=True):
         st.session_state.registros = []
+        st.session_state.archivos_procesados = set()
+        st.session_state.avisos_carga = []
+        st.session_state.revision_cargas += 1
+        st.session_state.cargador_version += 1
         st.rerun()
 
 # 1. ZONA DRAG & DROP
@@ -380,22 +589,23 @@ archivos = st.file_uploader(
     "Arrastra tus archivos PDF aquí (puedes subir varios a la vez):",
     type=["pdf"],
     accept_multiple_files=True,
+    key=f"manifiestos_{st.session_state.cargador_version}",
     help="Arrastra tus PDFs de MIC/DTA o Manifiestos de carga."
 )
 
 if archivos:
-    nuevos = 0
-    mics_ya_cargados = [r.get("MIC ELEC.") for r in st.session_state.registros if r.get("MIC ELEC.")]
-    
-    for arc in archivos:
-        texto = extraer_texto_pdf(arc)
-        datos = procesar_manifiesto(texto, arc.name)
-        if datos["MIC ELEC."] not in mics_ya_cargados or not datos["MIC ELEC."]:
-            st.session_state.registros.append(datos)
-            nuevos += 1
-            
+    registros_antes = [dict(fila) for fila in st.session_state.registros]
+    nuevos, avisos = cargar_archivos(archivos, st.session_state.registros, st.session_state.archivos_procesados)
+    st.session_state.avisos_carga.extend(avisos)
+    if st.session_state.registros != registros_antes:
+        st.session_state.revision_cargas += 1
     if nuevos > 0:
         st.success(f"✅ Se procesaron {nuevos} nuevo(s) manifiesto(s).")
+
+if st.session_state.avisos_carga:
+    with st.expander("Revisar los archivos cargados", expanded=True):
+        for aviso in st.session_state.avisos_carga:
+            st.warning(aviso)
 
 # 2. PLANILLA INTERACTIVA
 st.subheader("📊 2. Planilla de Cargas del Mes")
@@ -407,13 +617,17 @@ if st.session_state.registros:
     col_m1.metric("Total Camiones", len(df_actual))
     
     st.caption("✏️ Puedes hacer doble clic en cualquier celda para corregir o agregar información antes de guardar.")
-    df_editado = st.data_editor(
+    st.caption("Los datos que no se pudieron identificar quedan en blanco; completalos antes de guardar.")
+    st.caption("Si un manifiesto tiene varios CRT, aparecen juntos en la columna CRT, separados por punto y coma.")
+    clave_editor = f"editor_cargas_{st.session_state.revision_cargas}"
+    st.data_editor(
         df_actual,
         use_container_width=True,
         num_rows="dynamic",
-        key="editor_cargas"
+        key=clave_editor,
+        on_change=confirmar_edicion,
+        args=(clave_editor,),
     )
-    st.session_state.registros = df_editado.to_dict('records')
 
     # 3. GUARDADO EN GOOGLE SHEETS
     st.divider()
@@ -422,6 +636,7 @@ if st.session_state.registros:
     
     with col_g1:
         st.markdown("#### ☁️ Google Sheets")
+        st.caption("Agrega cargas nuevas y completa los CRT de un MIC ya guardado. Conserva los demás datos de las filas existentes.")
         if st.button("📤 Guardar / Sincronizar en Google Sheets", type="primary", use_container_width=True):
             if not sheet_url:
                 st.error("Por favor, ingresa el enlace de tu Google Sheet en la barra lateral.")
