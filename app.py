@@ -138,7 +138,10 @@ _MONEDAS = r"(?:USD|US\$|U\$S|USS|BRL|R\$|EUR|ARS|REALES|REAIS|PESOS)"
 
 def _secciones_manifiesto(texto):
     # Algunos generadores pegan el español a la traducción o la placa al rótulo.
-    texto = re.sub(r"(?i)(CAMI[ÓO]N)(?=PLACA)|(?<=REMOLQUE)(?=SEMI)|(?<=[A-Z0-9])(?=Placa:)", lambda m: (m.group(1) or "") + "\n", texto)
+    texto = re.sub(
+        r"(?i)(CAMI[ÓO]N)(?=PLACA)|(?<=REMOLQUE)(?=SEMI)|(?<=[A-Z0-9])(?=P[ \t]*L[ \t]*A[ \t]*C[ \t]*A[ \t]*:)",
+        lambda m: (m.group(1) or "") + "\n", texto,
+    )
     normalizado = _normalizar_busqueda(texto)
     matches = list(_ENCABEZADOS_MANIFIESTO.finditer(normalizado))
     secciones = {}
@@ -261,7 +264,9 @@ def _formatear_importe(valor, moneda):
 def _identificador_campo(contenido):
     linea = _primera_linea_campo(contenido)
     linea = re.sub(r"^(?:NRO\.?|NR\.?|NUMERO|N[°º?O.]?)\s*[:.-]?\s*", "", linea, flags=re.I)
-    linea = re.sub(r"(?<=[A-Za-z0-9])\s*([./-])\s*(?=[A-Za-z0-9])", r"\1", linea)
+    # Unir grupos numéricos separados (00550 - 00007457), no notas como
+    # «E-0044-00008810 - OPERACION TRIANGULAR».
+    linea = re.sub(r"(?<=\d)\s*([./-])\s*(?=\d)", r"\1", linea)
     match = re.match(r"([A-Za-z0-9]+(?:[./-][A-Za-z0-9]+)*)", linea)
     if match and re.search(r"\d", match.group(1)):
         return match.group(1)
