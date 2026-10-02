@@ -558,7 +558,7 @@ def obtener_o_crear_pestana(spreadsheet, nombre, columnas):
 
 
 def guardar_en_google_sheets(df: pd.DataFrame, sheet_target: str, worksheet_name: str = None):
-    """Agrega cargas y completa CRT con sus fletes y seguros por MIC."""
+    """Inserta MIC nuevos y reemplaza los existentes con la fila revisada en la app."""
     spreadsheet = conectar_google_sheets(sheet_target)
     columnas = list(df.columns)
     worksheet_name = worksheet_name or nombre_hoja_mensual()
@@ -581,7 +581,8 @@ def guardar_en_google_sheets(df: pd.DataFrame, sheet_target: str, worksheet_name
         if mic:
             existentes.setdefault(mic, []).append((numero_fila, valores))
 
-    nuevas_filas, nuevas_por_mic, cambios_crt = [], {}, {}
+    nuevas_filas, nuevas_por_mic, actualizaciones = [], {}, {}
+    recibidos = {}
     for _, row in df.iterrows():
         valores = ["" if pd.isna(row.get(col, "")) else str(row.get(col, "")) for col in encabezados]
         if not any(valor.strip() for valor in valores):
@@ -589,37 +590,42 @@ def guardar_en_google_sheets(df: pd.DataFrame, sheet_target: str, worksheet_name
         mic = normalizar_mic(valores[idx_mic])
         valores[idx_mic] = mic
         valores[idx_crt] = combinar_crts(valores[idx_crt])
+        # Reunir archivos del mismo lote antes de reemplazar la fila guardada.
+        # Los importes del último registro prevalecen para un mismo CRT.
+        if mic and mic in recibidos:
+            anterior_lote = recibidos[mic]
+            combinado = combinar_datos_crt(dict(zip(encabezados, anterior_lote)), dict(zip(encabezados, valores)), preferir_nuevo=True)
+            for campo, valor in combinado.items():
+                valores[encabezados.index(campo)] = valor
+        if mic:
+            recibidos[mic] = valores
         if mic and mic in existentes:
             if len(existentes[mic]) != 1:
-                raise ValueError(f"El MIC {mic} aparece en varias filas de Google Sheets. Revisá ese duplicado antes de completar sus CRT.")
+                raise ValueError(f"El MIC {mic} aparece en varias filas de Google Sheets. Revisá ese duplicado antes de actualizarlo.")
             numero_fila, anterior = existentes[mic][0]
-            base = dict(zip(encabezados, anterior))
-            base.update(cambios_crt.get(numero_fila, {}))
-            combinado = combinar_datos_crt(base, dict(zip(encabezados, valores)))
-            diferencias = {campo: valor for campo, valor in combinado.items()
-                           if valor != anterior[encabezados.index(campo)]}
+            diferencias = {campo: valores[i] for i, campo in enumerate(encabezados)
+                           if valores[i] != anterior[i]}
             if diferencias:
-                cambios_crt[numero_fila] = diferencias
+                actualizaciones[numero_fila] = diferencias
+            else:
+                actualizaciones.pop(numero_fila, None)
             continue
         if mic and mic in nuevas_por_mic:
-            anterior = nuevas_filas[nuevas_por_mic[mic]]
-            combinado = combinar_datos_crt(dict(zip(encabezados, anterior)), dict(zip(encabezados, valores)))
-            for campo, valor in combinado.items():
-                anterior[encabezados.index(campo)] = valor
+            nuevas_filas[nuevas_por_mic[mic]] = valores
             continue
         if mic:
             nuevas_por_mic[mic] = len(nuevas_filas)
         nuevas_filas.append(valores)
 
-    if cambios_crt:
+    if actualizaciones:
         ws.batch_update([
             {"range": gspread.utils.rowcol_to_a1(numero_fila, encabezados.index(campo) + 1), "values": [[valor]]}
-            for numero_fila, cambios in cambios_crt.items()
+            for numero_fila, cambios in actualizaciones.items()
             for campo, valor in cambios.items()
         ], value_input_option="RAW")
     if nuevas_filas:
         ws.append_rows(nuevas_filas, value_input_option="RAW")
-    return len(nuevas_filas) + len(cambios_crt)
+    return len(nuevas_filas) + len(actualizaciones)
 
 # ==============================================================================
 # 4. INTERFAZ WEB STREAMLIT
@@ -664,7 +670,7 @@ def desglosar_gasto_crt(crts, valor):
     return gastos, sin_asignar
 
 
-def combinar_datos_crt(anterior, nuevo):
+def combinar_datos_crt(anterior, nuevo, preferir_nuevo=False):
     """Completa CRT, flete y seguro; conserva importes ya revisados del mismo CRT."""
     resultado = {"CRT": combinar_crts(anterior.get("CRT"), nuevo.get("CRT"))}
     numeros = resultado["CRT"].split("; ") if resultado["CRT"] else []
@@ -672,7 +678,7 @@ def combinar_datos_crt(anterior, nuevo):
         gastos, sin_asignar = desglosar_gasto_crt(anterior.get("CRT"), anterior.get(campo))
         adicionales, sin_numero = desglosar_gasto_crt(nuevo.get("CRT"), nuevo.get(campo))
         for crt, importe in adicionales.items():
-            if not gastos.get(crt):
+            if not gastos.get(crt) or preferir_nuevo:
                 gastos[crt] = importe
         sin_asignar = list(dict.fromkeys(sin_asignar + sin_numero))
         if len(numeros) == 1 and not sin_asignar:
@@ -851,7 +857,7 @@ if st.session_state.registros:
     
     with col_g1:
         st.markdown("#### ☁️ Google Sheets")
-        st.caption("Agrega cargas nuevas y completa los CRT con sus fletes y seguros de un MIC ya guardado. Conserva los importes ya registrados de cada CRT y los demás datos de la fila.")
+        st.caption("Si el MIC ya existe en esta pestaña, actualiza su fila con todos los datos que ves en la app, incluidos los campos vacíos. Si es nuevo, agrega una fila. Revisá los datos antes de guardar.")
         if st.button("📤 Guardar / Sincronizar en Google Sheets", type="primary", use_container_width=True):
             if not sheet_url:
                 st.error("Por favor, ingresa el enlace de tu Google Sheet en la barra lateral.")
