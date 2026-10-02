@@ -62,7 +62,18 @@ def extraer_texto_pdf(archivo_pdf) -> str:
     """Lee texto seleccionable; los errores los muestra la interfaz por archivo."""
     archivo_pdf.seek(0)
     lector = pypdf.PdfReader(archivo_pdf)
-    return "\n".join(pagina.extract_text() or "" for pagina in lector.pages).strip()
+    class TextoPDF(str):
+        """Conserva las columnas del CRT además del texto para los demás campos."""
+
+    textos, layouts = [], []
+    for pagina in lector.pages:
+        texto = pagina.extract_text() or ""
+        textos.append(texto)
+        if "gastos a pagar" in texto.lower():
+            layouts.append(pagina.extract_text(extraction_mode="layout") or "")
+    resultado = TextoPDF("\n".join(textos).strip())
+    resultado.paginas_layout = layouts
+    return resultado
 
 """Extracción conservadora de manifiestos con texto, sin servicios externos."""
 
@@ -97,7 +108,8 @@ def _rotulo(patron, numeros=""):
 _ROTULOS_MANIFIESTO = [
     ("ignorar", _rotulo(r"(?:FECHA|DATA)\s*(?:DE\s*)?(?:NACIMIENTO|NASCIMENTO|VENCIMIENTO|VENCIMENTO)")),
     ("origen", _rotulo(r"ADUANA(?:\s*,?\s*CIUDAD\s*Y\s*PAIS)?\s*(?:DE\s*)?PARTIDA(?:\s*/\s*ALFANDEGA(?:\s*,?\s*CIDADE\s*E\s*PAIS)?\s*DE\s*PARTIDA)?|PAIS\s*DE\s*ORIGEN|ORIGEN", "7|26")),
-    ("destino", _rotulo(r"ADUANA\s*(?:DE\s*)?DESTINO(?:\s*/\s*ALFANDEGA\s*(?:DE\s*)?DESTINO)?|CIUDAD\s*Y\s*PAIS\s*DE\s*DESTINO(?:\s*FINAL)?", "24|8")),
+    ("aduana_destino", _rotulo(r"(?:ADUANA|ALFANDEGA)\s*(?:DE\s*)?DESTINO", "24")),
+    ("destino", _rotulo(r"(?:CIUDAD\s*Y|CIDADE\s*E)\s*PAIS\s*DE\s*DESTINO(?:\s*FINAL)?", "8")),
     ("salida", _rotulo(r"ADUANA\s*(?:DE\s*)?(?:SALIDA|FRONTERA)|PASO\s*FRONTERIZO")),
     ("ruta", _rotulo(r"RUTA(?:\s*(?:Y\s*PLAZO\s*DE\s*TRANSPORTE|PREVISTA|DE\s*TRANSPORTE))?|ITINERARIO", "40")),
     ("exportador", _rotulo(r"(?:REMITENTE|REMETENTE|EXPORTADOR)(?:\s*/\s*(?:REMITENTE|REMETENTE|EXPORTADOR))?", "33|6|1")),
@@ -109,10 +121,10 @@ _ROTULOS_MANIFIESTO = [
     ("valor", _rotulo(r"(?:MONEDA\s*Y\s*)?VALOR\s*FO[BT]", "27|15")),
     ("valor", r"(?<!\w)14[.)]?\s+VALOR(?!\w)"),
     ("reales", _rotulo(r"(?:FLETE|FRETE)\s*(?:(?:EN|EM)\s*)?(?:REALES|REAIS|BRL|R\$)", "28")),
-    ("flete", _rotulo(r"(?:FLETE|FRETE)(?:\s*/\s*(?:FLETE|FRETE))?(?:\s*(?:EN|EM)\s*(?:US[S$]|USD|DOLARES))?", "28")),
-    ("seguro", _rotulo(r"SEGURO(?:\s*(?:/|X)\s*SEGURO)?(?:\s*(?:(?:EN|EM)\s*)?(?:US[S$]|USD))?", "29")),
-    ("tractor", _rotulo(r"PLACA\s*(?:DE[L]?\s*)?(?:CAMION|CAMINHAO|TRACTOR)|PATENTE\s*(?:DE[L]?\s*)?(?:CAMION|TRACTOR)|TRACTOR", "11|18")),
-    ("carreta", _rotulo(r"SEMIR?REMOLQUE|SEMIREMOLQUE|SEMI[-\s]?REBOQUE|CARRETA|ACOPLADO", "15|20")),
+    ("flete", _rotulo(r"(?:FLETE|FRETE)(?:\s*/\s*(?:FLETE|FRETE))?(?:\s*(?:(?:EN|EM)\s*)?(?:US\s*\$|U\s*\$\s*S|USS|USD|DOLARES))?", "28")),
+    ("seguro", _rotulo(r"SEGURO(?:\s*(?:/|X)\s*SEGURO)?(?:\s*(?:(?:EN|EM)\s*)?(?:US\s*\$|U\s*\$\s*S|USS|USD))?", "29")),
+    ("tractor", _rotulo(r"(?:PLACA|PATENTE)\s*(?:(?:DEL?|DO)\s*)?(?:CAMION|CAMINH[A?]O|TRACTOR)|TRACTOR", "11|18")),
+    ("carreta", _rotulo(r"(?:(?:PLACA|PATENTE)\s*(?:(?:DEL?|DO)\s*)?)?(?:SEMI[-\s]?R?REMOLQUE|SEMI[-\s]?REBOQUE|CARRETA|ACOPLADO)", "15|20")),
     ("chofer", _rotulo(r"CONDUCTOR(?:\s*1)?|CHOFER|MOTORISTA")),
     ("dni", _rotulo(r"DOC(?:UMENTO)?(?:\s*(?:DE\s*IDENTIDAD|DEL\s*CHOFER))?|DNI|CEDULA(?:\s*DE\s*IDENTIDAD)?")),
     ("ignorar", _rotulo(r"MIC(?:\s*ELEC(?:TRONICO)?\.?)?(?:\s*/\s*DTA)?|CONSIGNATARIO|PESO(?:\s*BRUTO|\s*NETO)?|BULTOS|PRECINTOS?|MARCAS\s*Y\s*NUMEROS|DESCRIPCION\s*DE\s*(?:LA\s*)?MERCADERIA|GASTOS\s*A\s*PAGAR|OTROS\s*GASTOS|TRANSPORTISTA|TRANSPORTADOR|PERMISO|CUIT|CNPJ|RUT", "35|30|31|32|36|37|38|39|15|1|2|3|4|5")),
@@ -125,6 +137,8 @@ _MONEDAS = r"(?:USD|US\$|U\$S|USS|BRL|R\$|EUR|ARS|REALES|REAIS|PESOS)"
 
 
 def _secciones_manifiesto(texto):
+    # Algunos generadores pegan el español a la traducción o la placa al rótulo.
+    texto = re.sub(r"(?i)(CAMI[ÓO]N)(?=PLACA)|(?<=REMOLQUE)(?=SEMI)|(?<=[A-Z0-9])(?=Placa:)", lambda m: (m.group(1) or "") + "\n", texto)
     normalizado = _normalizar_busqueda(texto)
     matches = list(_ENCABEZADOS_MANIFIESTO.finditer(normalizado))
     secciones = {}
@@ -133,7 +147,7 @@ def _secciones_manifiesto(texto):
         fin = matches[indice + 1].start() if indice + 1 < len(matches) else len(texto)
         contenido = texto[match.end():fin]
         # Un campo numerado desconocido en una línea nueva también es límite.
-        corte = re.search(r"(?m)^\s*\d{1,2}[.)]?\s+[A-Za-zÁÉÍÓÚÑÜáéíóúñü]", contenido)
+        corte = re.search(r"(?m)^\s*\d{1,2}[.)]?\s+(?!(?:USD\b|US\s*\$|U\s*\$\s*S|USS\b|BRL\b|R\$|EUR\b|ARS\b))[A-Za-zÁÉÍÓÚÑÜáéíóúñü]", contenido, re.I)
         if corte:
             contenido = contenido[:corte.start()]
         secciones.setdefault(tipo, []).append((texto[match.start():match.end()], contenido))
@@ -144,7 +158,7 @@ def _primera_linea_campo(contenido):
     contenido = re.sub(r"^\s*[:/\-–.]*\s*", "", contenido)
     contenido = re.sub(r"^\([^\n)]*\)\s*[:/\-–.]*\s*", "", contenido)
     for linea in contenido.splitlines():
-        linea = linea.strip(" \t:/–")
+        linea = linea.strip(" \t:/–-")
         if not linea:
             continue
         if _normalizar_busqueda(linea).strip(" .:-") in {
@@ -158,7 +172,10 @@ def _primera_linea_campo(contenido):
 
 def _localidad_campo(contenido, quitar_pais=False):
     for linea in contenido.splitlines():
-        linea = linea.strip(" \t:/–")
+        linea = linea.strip(" \t:/–-")
+        # Una traducción del rótulo nunca es una localidad.
+        if re.match(r"^(?:(?:CIUDAD\s*Y|CIDADE\s*E)\s*PAIS|(?:ADUANA|ALFANDEGA)\s*(?:DE\s*)?DESTINO)\b", _normalizar_busqueda(linea)):
+            continue
         if not linea or not re.search(r"[A-Za-zÁÉÍÓÚÑáéíóúñ]", linea):
             continue
         linea = re.sub(r"^\d+\s*[-.]?\s*", "", linea)
@@ -206,10 +223,11 @@ def _decimal_manifiesto(token):
 def _importe_campo(rotulo, contenido, moneda):
     # El valor debe estar inmediatamente debajo/junto al encabezado. Una nota
     # posterior con otro importe no puede completar un campo que estaba vacío.
-    lineas = [linea.strip(" \t:") for linea in contenido.splitlines() if linea.strip(" \t:")]
+    lineas = [linea.strip(" \t:/") for linea in contenido.splitlines() if linea.strip(" \t:/")]
     if not lineas:
         return None
-    texto = _normalizar_busqueda(lineas[0])
+    texto = re.sub(r"US\s+\$", "US$", _normalizar_busqueda(lineas[0]))
+    texto = re.sub(r"U\s*\$\s*S", "U$S", texto)
     if re.fullmatch(_MONEDAS, texto) and len(lineas) > 1:
         texto += " " + _normalizar_busqueda(lineas[1])
     todas = list(re.finditer(_MONEDAS, texto))
@@ -243,6 +261,7 @@ def _formatear_importe(valor, moneda):
 def _identificador_campo(contenido):
     linea = _primera_linea_campo(contenido)
     linea = re.sub(r"^(?:NRO\.?|NR\.?|NUMERO|N[°º?O.]?)\s*[:.-]?\s*", "", linea, flags=re.I)
+    linea = re.sub(r"(?<=[A-Za-z0-9])\s*([./-])\s*(?=[A-Za-z0-9])", r"\1", linea)
     match = re.match(r"([A-Za-z0-9]+(?:[./-][A-Za-z0-9]+)*)", linea)
     if match and re.search(r"\d", match.group(1)):
         return match.group(1)
@@ -301,7 +320,10 @@ def procesar_manifiesto(texto: str, nombre_archivo: str = "") -> dict:
             if valor:
                 datos[columna] = valor
                 break
-    for tipo, columna in (("origen", "ORIGEN"), ("destino", "ADUANA DESTINO"), ("salida", "ADUANA DE SALIDA")):
+    # La columna del usuario usa la ciudad de destino final (casillero 8).
+    for tipo, columna in (("origen", "ORIGEN"), ("destino", "ADUANA DESTINO"), ("aduana_destino", "ADUANA DESTINO"), ("salida", "ADUANA DE SALIDA")):
+        if datos[columna]:
+            continue
         for _, contenido in secciones.get(tipo, []):
             valor = _localidad_campo(contenido, quitar_pais=(tipo == "origen"))
             if valor:
@@ -350,18 +372,79 @@ def procesar_manifiesto(texto: str, nombre_archivo: str = "") -> dict:
                     datos["FLETE EN REALES"] = _formatear_importe(valor, "BRL")
                     break
 
-    patente = r"(?<![A-Z0-9])(?:[A-Z]{2}[ \t]*\d{3}[ \t]*[A-Z]{2}|[A-Z]{3}[ \t]*\d[A-Z0-9]\d{2}|[A-Z]{3}[ \t]*\d{3,4})(?![A-Z0-9])"
+    patente = r"(?<![A-Z0-9])(?:[A-Z]{2}[ \t-]*\d{3}[ \t-]*[A-Z]{2}|[A-Z]{3}[ \t-]*\d[A-Z0-9]\d{2}|[A-Z]{3}[ \t-]*\d{3,4})(?![A-Z0-9])"
     for tipo, columna in (("tractor", "TRACTOR"), ("carreta", "CARRETA")):
         for _, contenido in secciones.get(tipo, []):
             match = re.search(patente, _normalizar_busqueda(contenido))
             if match:
-                datos[columna] = re.sub(r"\s+", "", match.group())
+                datos[columna] = re.sub(r"[\s-]+", "", match.group())
                 break
     for _, contenido in secciones.get("dni", []):
         match = re.match(r"\s*[:.-]?\s*(?:CI\s*)?([0-9][0-9.\-]{4,18}[0-9])(?!\d)", contenido, re.I)
         if match:
             datos["DNI"] = match.group(1)
             break
+    # Los importes del MIC pueden ser parciales. El usuario toma el valor y
+    # los gastos del CRT (casilleros 14 y 15), no el flete externo del 19.
+    for layout in getattr(texto, "paginas_layout", ()):
+        importes = _importes_crt_layout(layout)
+        if importes:
+            datos.update(importes)
+            break
+    return datos
+
+
+def _importes_crt_layout(layout):
+    """Lee celdas por columna; nunca mezcla el total con flete o seguro."""
+    lineas = layout.replace("\r", "").splitlines()
+    normalizadas = [_normalizar_busqueda(linea) for linea in lineas]
+    inicio = next((i for i, linea in enumerate(normalizadas)
+                   if re.search(r"\b15\s+GASTOS A PAGAR\b", linea)), None)
+    if inicio is None:
+        return {}
+    # El casillero 16 marca el borde derecho de la tabla de gastos.
+    borde = re.search(r"\b16\s+DECLARACION", normalizadas[inicio])
+    if not borde:
+        return {}
+    limite = borde.start()
+    # Si hay un CRT identificado, un gasto ilegible queda para revisión;
+    # no se completa con el importe parcial del MIC.
+    datos = {"VALOR": "", "FRETE": "", "SEGURO": ""}
+    for i, linea in enumerate(normalizadas[:inicio]):
+        rotulo = re.search(r"\b14\s+VALOR\b", linea)
+        if not rotulo:
+            continue
+        celda = "\n".join(l[rotulo.start():] for l in normalizadas[i + 1:inicio])
+        moneda = re.findall(r"\b(?:USD|BRL|ARS|EUR)\b", celda)
+        numeros = re.findall(r"(?<![\w.,])\d+(?:[.,]\d+)+(?![\w.,])", celda)
+        if set(moneda) == {"USD"} and len(numeros) == 1:
+            valor = _decimal_manifiesto(numeros[0])
+            if valor is not None:
+                datos["VALOR"] = _formatear_importe(valor, "USD")
+    fin = next((i for i in range(inicio + 1, len(lineas))
+                if re.search(r"\b19\s+MONTO", normalizadas[i])), len(lineas))
+    tabla = [l[:limite] for l in normalizadas[inicio:fin]]
+    rubros = []
+    for i, linea in enumerate(tabla):
+        match = re.search(r"\b(FLETE\s*/\s*FRETE|SEGURO\s*/\s*SEGURO|OTROS\s*/\s*OUTROS|TOTAL)\b", linea)
+        if match:
+            rubros.append((i, match))
+    for pos, (i, match) in enumerate(rubros):
+        columna = "FRETE" if match.group().startswith("FLETE") else "SEGURO" if match.group().startswith("SEGURO") else None
+        if not columna:
+            continue
+        fin_rubro = rubros[pos + 1][0] if pos + 1 < len(rubros) else len(tabla)
+        contenido = tabla[i][match.end():] + "\n" + "\n".join(tabla[i + 1:fin_rubro])
+        # Cada columna pagadora debe tener monto y moneda. Se suman remitente
+        # y destinatario solo si ambas celdas se pudieron leer en dólares.
+        celdas = re.findall(r"(?<![\w.,])((?:\d+(?:[.,]\d+)*|[.,]\d{2}))\s+(USD|BRL|ARS|EUR)\b", contenido)
+        if len(celdas) != 2 or any(moneda != "USD" for _, moneda in celdas):
+            continue
+        valores = [_decimal_manifiesto("0" + n if n.startswith((".", ",")) else n) for n, _ in celdas]
+        if any(v is None for v in valores):
+            continue
+        valor = sum(valores, Decimal("0.00"))
+        datos[columna] = format(valor, ".2f") if columna == "SEGURO" else _formatear_importe(valor, "USD")
     return datos
 
 # ==============================================================================
