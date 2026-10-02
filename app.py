@@ -386,12 +386,51 @@ def procesar_manifiesto(texto: str, nombre_archivo: str = "") -> dict:
             break
     # Los importes del MIC pueden ser parciales. El usuario toma el valor y
     # los gastos del CRT (casilleros 14 y 15), no el flete externo del 19.
+    gastos_por_crt = {}
+    importes_sin_numero = []
     for layout in getattr(texto, "paginas_layout", ()):
         importes = _importes_crt_layout(layout)
         if importes:
-            datos.update(importes)
-            break
+            numero = _numero_crt_layout(layout)
+            if numero:
+                if numero not in crts:
+                    crts.append(numero)
+                previo = gastos_por_crt.setdefault(numero, {})
+                for campo, valor in importes.items():
+                    if not previo.get(campo):
+                        previo[campo] = valor
+            else:
+                importes_sin_numero.append(importes)
+    datos["CRT"] = "; ".join(crts)
+    if len(crts) == 1 and gastos_por_crt:
+        datos.update(gastos_por_crt[crts[0]])
+    elif len(crts) > 1 and (gastos_por_crt or importes_sin_numero):
+        for campo in ("FRETE", "SEGURO"):
+            datos[campo] = "; ".join(
+                f"{crt}: {gastos_por_crt.get(crt, {}).get(campo) or 'sin detectar'}"
+                for crt in crts
+            )
+        if gastos_por_crt:
+            datos["VALOR"] = next(iter(gastos_por_crt.values())).get("VALOR", "")
+    elif importes_sin_numero:
+        datos.update(importes_sin_numero[0])
     return datos
+
+
+def _numero_crt_layout(layout):
+    """Número del casillero 2 de esta página, sin tomar el de otro CRT."""
+    lineas = layout.replace("\r", "").splitlines()
+    for i, linea in enumerate(lineas):
+        rotulo = re.search(r"\b2\s+NUMERO\s*/\s*NUMERO\b", _normalizar_busqueda(linea))
+        if not rotulo:
+            continue
+        for siguiente in lineas[i + 1:]:
+            celda = siguiente[rotulo.start():].strip()
+            if not celda:
+                continue
+            numeros = _crts_campo(celda)
+            return numeros[0] if len(numeros) == 1 else ""
+    return ""
 
 
 def _importes_crt_layout(layout):
@@ -514,7 +553,7 @@ def obtener_o_crear_pestana(spreadsheet, nombre, columnas):
 
 
 def guardar_en_google_sheets(df: pd.DataFrame, sheet_target: str, worksheet_name: str = None):
-    """Agrega cargas y completa los CRT de un MIC existente sin pisar otros datos."""
+    """Agrega cargas y completa CRT con sus fletes y seguros por MIC."""
     spreadsheet = conectar_google_sheets(sheet_target)
     columnas = list(df.columns)
     worksheet_name = worksheet_name or nombre_hoja_mensual()
@@ -549,13 +588,19 @@ def guardar_en_google_sheets(df: pd.DataFrame, sheet_target: str, worksheet_name
             if len(existentes[mic]) != 1:
                 raise ValueError(f"El MIC {mic} aparece en varias filas de Google Sheets. Revisá ese duplicado antes de completar sus CRT.")
             numero_fila, anterior = existentes[mic][0]
-            combinado = combinar_crts(cambios_crt.get(numero_fila, anterior[idx_crt]), valores[idx_crt])
-            if combinado != combinar_crts(anterior[idx_crt]):
-                cambios_crt[numero_fila] = combinado
+            base = dict(zip(encabezados, anterior))
+            base.update(cambios_crt.get(numero_fila, {}))
+            combinado = combinar_datos_crt(base, dict(zip(encabezados, valores)))
+            diferencias = {campo: valor for campo, valor in combinado.items()
+                           if valor != anterior[encabezados.index(campo)]}
+            if diferencias:
+                cambios_crt[numero_fila] = diferencias
             continue
         if mic and mic in nuevas_por_mic:
             anterior = nuevas_filas[nuevas_por_mic[mic]]
-            anterior[idx_crt] = combinar_crts(anterior[idx_crt], valores[idx_crt])
+            combinado = combinar_datos_crt(dict(zip(encabezados, anterior)), dict(zip(encabezados, valores)))
+            for campo, valor in combinado.items():
+                anterior[encabezados.index(campo)] = valor
             continue
         if mic:
             nuevas_por_mic[mic] = len(nuevas_filas)
@@ -563,8 +608,9 @@ def guardar_en_google_sheets(df: pd.DataFrame, sheet_target: str, worksheet_name
 
     if cambios_crt:
         ws.batch_update([
-            {"range": gspread.utils.rowcol_to_a1(numero_fila, idx_crt + 1), "values": [[crt]]}
-            for numero_fila, crt in cambios_crt.items()
+            {"range": gspread.utils.rowcol_to_a1(numero_fila, encabezados.index(campo) + 1), "values": [[valor]]}
+            for numero_fila, cambios in cambios_crt.items()
+            for campo, valor in cambios.items()
         ], value_input_option="RAW")
     if nuevas_filas:
         ws.append_rows(nuevas_filas, value_input_option="RAW")
@@ -589,6 +635,50 @@ def combinar_crts(*valores):
             if numero and numero not in numeros:
                 numeros.append(numero)
     return "; ".join(numeros)
+
+
+def desglosar_gasto_crt(crts, valor):
+    """Recupera asociaciones visibles, conservando importes antiguos sin asignar."""
+    numeros = combinar_crts(crts).split("; ") if combinar_crts(crts) else []
+    valor = "" if valor is None or pd.isna(valor) else str(valor).strip()
+    if not valor:
+        return {}, []
+    partes = [parte.strip() for parte in valor.split(";")]
+    gastos, sin_asignar = {}, []
+    for parte in partes:
+        numero, separador, importe = parte.partition(":")
+        numero = combinar_crts(numero)
+        if separador and numero in numeros:
+            gastos[numero] = "" if importe.strip().lower() == "sin detectar" else importe.strip()
+        elif separador and numero == "SIN ASIGNAR":
+            sin_asignar.append(importe.strip())
+        elif len(numeros) == 1 and len(partes) == 1:
+            gastos[numeros[0]] = valor
+        else:
+            sin_asignar.append(parte)
+    return gastos, sin_asignar
+
+
+def combinar_datos_crt(anterior, nuevo):
+    """Completa CRT, flete y seguro; conserva importes ya revisados del mismo CRT."""
+    resultado = {"CRT": combinar_crts(anterior.get("CRT"), nuevo.get("CRT"))}
+    numeros = resultado["CRT"].split("; ") if resultado["CRT"] else []
+    for campo in ("FRETE", "SEGURO"):
+        gastos, sin_asignar = desglosar_gasto_crt(anterior.get("CRT"), anterior.get(campo))
+        adicionales, sin_numero = desglosar_gasto_crt(nuevo.get("CRT"), nuevo.get(campo))
+        for crt, importe in adicionales.items():
+            if not gastos.get(crt):
+                gastos[crt] = importe
+        sin_asignar = list(dict.fromkeys(sin_asignar + sin_numero))
+        if len(numeros) == 1 and not sin_asignar:
+            resultado[campo] = gastos.get(numeros[0], "")
+        elif any(gastos.values()) or sin_asignar:
+            partes = [f"{crt}: {gastos.get(crt) or 'sin detectar'}" for crt in numeros]
+            partes.extend(f"Sin asignar: {importe}" for importe in sin_asignar)
+            resultado[campo] = "; ".join(partes)
+        else:
+            resultado[campo] = ""
+    return resultado
 
 
 def cargar_archivos(archivos, registros, procesados):
@@ -616,11 +706,10 @@ def cargar_archivos(archivos, registros, procesados):
         mic = normalizar_mic(datos.get("MIC ELEC."))
         if mic and mic in mics:
             existente = next(r for r in registros if normalizar_mic(r.get("MIC ELEC.")) == mic)
-            anteriores = combinar_crts(existente.get("CRT"))
-            combinados = combinar_crts(anteriores, datos.get("CRT"))
-            if combinados != anteriores:
-                existente["CRT"] = combinados
-                avisos.append(f"{archivo.name}: se incorporaron los CRT adicionales al MIC {mic} en la misma fila.")
+            combinados = combinar_datos_crt(existente, datos)
+            if any(existente.get(campo, "") != valor for campo, valor in combinados.items()):
+                existente.update(combinados)
+                avisos.append(f"{archivo.name}: se completaron los CRT y sus fletes y seguros del MIC {mic} en la misma fila.")
                 continue
             avisos.append(f"{archivo.name}: el MIC {mic} ya está cargado. No se agregó otra fila.")
             continue
@@ -628,8 +717,8 @@ def cargar_archivos(archivos, registros, procesados):
         if mic:
             mics.add(mic)
         nuevos += 1
-        campos_revision = ("MIC ELEC.", "fecha", "EXPORTADOR", "IMPORTADOR", "VALOR", "FRETE", "TRACTOR", "CARRETA", "CHOFER", "DNI")
-        faltantes = [campo for campo in campos_revision if not datos.get(campo)]
+        campos_revision = ("MIC ELEC.", "fecha", "EXPORTADOR", "IMPORTADOR", "VALOR", "FRETE", "SEGURO", "TRACTOR", "CARRETA", "CHOFER", "DNI")
+        faltantes = [campo for campo in campos_revision if not datos.get(campo) or 'sin detectar' in str(datos.get(campo)).lower()]
         if faltantes:
             avisos.append(f"{archivo.name}: revisá los campos sin detectar: {', '.join(faltantes)}.")
     return nuevos, avisos
@@ -739,7 +828,7 @@ if st.session_state.registros:
     
     st.caption("✏️ Puedes hacer doble clic en cualquier celda para corregir o agregar información antes de guardar.")
     st.caption("Los datos que no se pudieron identificar quedan en blanco; completalos antes de guardar.")
-    st.caption("Si un manifiesto tiene varios CRT, aparecen juntos en la columna CRT, separados por punto y coma.")
+    st.caption("Si un manifiesto tiene varios CRT, aparecen en la misma fila. FRETE y SEGURO identifican el importe de cada CRT por su número; los importes sin detectar requieren revisión.")
     clave_editor = f"editor_cargas_{st.session_state.revision_cargas}"
     st.data_editor(
         df_actual,
@@ -757,7 +846,7 @@ if st.session_state.registros:
     
     with col_g1:
         st.markdown("#### ☁️ Google Sheets")
-        st.caption("Agrega cargas nuevas y completa los CRT de un MIC ya guardado. Conserva los demás datos de las filas existentes.")
+        st.caption("Agrega cargas nuevas y completa los CRT con sus fletes y seguros de un MIC ya guardado. Conserva los importes ya registrados de cada CRT y los demás datos de la fila.")
         if st.button("📤 Guardar / Sincronizar en Google Sheets", type="primary", use_container_width=True):
             if not sheet_url:
                 st.error("Por favor, ingresa el enlace de tu Google Sheet en la barra lateral.")
